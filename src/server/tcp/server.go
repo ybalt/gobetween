@@ -7,6 +7,10 @@
 package tcp
 
 import (
+	"crypto/tls"
+	"net"
+	"time"
+
 	"../../balance"
 	"../../config"
 	"../../core"
@@ -16,10 +20,9 @@ import (
 	"../../stats"
 	"../../utils"
 	tlsutil "../../utils/tls"
+	"../../utils/tls/sni"
 	"../modules/access"
 	"../scheduler"
-	"crypto/tls"
-	"net"
 )
 
 /**
@@ -203,11 +206,14 @@ func (this *Server) Listen() (err error) {
 
 	log := logging.For("server.Listen")
 
-	if this.cfg.Protocol == "tcp" {
-		// Create tcp listener
-		this.listener, err = net.Listen("tcp", this.cfg.Bind)
+	// create tcp listener
+	this.listener, err = net.Listen("tcp", this.cfg.Bind)
 
-	} else {
+	var tlsConfig *tls.Config
+	sniEnabled := this.cfg.SniEnabled
+
+	if this.cfg.Protocol == "tls" {
+
 		// Create tls listener
 		var crt tls.Certificate
 		if crt, err = tls.LoadX509KeyPair(this.cfg.Tls.CertPath, this.cfg.Tls.KeyPath); err != nil {
@@ -215,14 +221,14 @@ func (this *Server) Listen() (err error) {
 			return err
 		}
 
-		this.listener, err = tls.Listen("tcp", this.cfg.Bind, &tls.Config{
+		tlsConfig = &tls.Config{
 			Certificates:             []tls.Certificate{crt},
 			CipherSuites:             tlsutil.MapCiphers(this.cfg.Tls.Ciphers),
 			PreferServerCipherSuites: this.cfg.Tls.PreferServerCiphers,
 			MinVersion:               tlsutil.MapVersion(this.cfg.Tls.MinVersion),
 			MaxVersion:               tlsutil.MapVersion(this.cfg.Tls.MaxVersion),
 			SessionTicketsDisabled:   !this.cfg.Tls.SessionTickets,
-		})
+		}
 	}
 
 	if err != nil {
@@ -233,9 +239,27 @@ func (this *Server) Listen() (err error) {
 	go func() {
 		for {
 			conn, err := this.listener.Accept()
+
 			if err != nil {
 				log.Error(err)
 				return
+			}
+
+			if sniEnabled {
+				var err error
+
+				//TODO move timeout to config
+				conn, err = sni.Sniff(conn, time.Second*5)
+
+				if err != nil {
+					log.Error(err)
+					return
+				}
+
+			}
+
+			if tlsConfig != nil {
+				conn = tls.Server(conn, tlsConfig)
 			}
 
 			this.connect <- conn
@@ -249,7 +273,6 @@ func (this *Server) Listen() (err error) {
  * Handle incoming connection and prox it to backend
  */
 func (this *Server) handle(clientConn net.Conn) {
-
 	log := logging.For("server.handle")
 
 	/* Check access if needed */
